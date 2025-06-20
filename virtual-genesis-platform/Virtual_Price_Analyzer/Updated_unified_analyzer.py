@@ -62,10 +62,13 @@ SHOW_TRANSACTION_DETAILS = True  # Set to True to show each transaction details
 UPDATE_MONGODB = True  # Set to True to update MongoDB documents with calculated prices
 ENABLE_REAL_TIME_TRACKING = True  # Set to True to enable real-time swap tracking
 ENABLE_PRICE_ANALYSIS = True  # Set to True to enable price analysis
+PROCESS_TOKENS_SEQUENTIALLY = False  # Process all tokens in parallel for speed
+RATE_LIMIT_DELAY = 0  # Minimal delay for faster processing
+ERROR_RETRY_DELAY = 2  # Reduce delay on errors (seconds)
 
 # Swap tracking settings
 SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
-CHUNK_SIZE = 500  # Block processing chunk size
+CHUNK_SIZE = 2000  # Increased block processing chunk size for speed
 
 # =============================================================================
 # BLOCKCHAIN CONNECTIONS
@@ -116,6 +119,35 @@ POOL_ABI = [
         "type": "function",
     },
 ]
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def web3_call_with_retries(func, max_retries=3, delay=1):
+    """
+    Execute a Web3 call with retry logic and delays
+    
+    Args:
+        func: Function to execute
+        max_retries: Maximum number of retries
+        delay: Delay between retries in seconds
+    
+    Returns:
+        Result of the function call
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            result = func()
+            if attempt > 0:
+                time.sleep(delay)  # Add delay after successful retry
+            return result
+        except Exception as e:
+            if attempt == max_retries:
+                raise e
+            if VERBOSE_OUTPUT:
+                print(f"⚠️ Web3 call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+            time.sleep(delay * (attempt + 1))  # Exponential backoff
 
 # =============================================================================
 # PRICE CALCULATION FUNCTIONS
@@ -245,6 +277,19 @@ def swapTypeFinder(decoded):
     else:
         return "unknown"
 
+def enforce_latest_n_swaps(collection, n=10):
+    """
+    Keep only the latest n documents in the collection (by blockNumber descending).
+    To disable this limit and store all swaps, simply comment out the call to this function.
+    """
+    count = collection.count_documents({})
+    if count > n:
+        # Find the _ids of the oldest documents to delete
+        to_delete = collection.find({}, {"_id": 1}).sort("blockNumber", 1).limit(count - n)
+        ids = [doc["_id"] for doc in to_delete]
+        if ids:
+            collection.delete_many({"_id": {"$in": ids}})
+
 def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
     """
     Track swaps for a specific liquidity pool
@@ -276,10 +321,20 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
     print(f"📊 Tracking swaps for {token_symbol} (LP: {lp_address}) starting at block {start_block}...")
 
     while True:
-        latest_block = w3.eth.block_number
-        to_block = min(current_block + CHUNK_SIZE - 1, latest_block)
+        try:
+            latest_block = web3_call_with_retries(lambda: w3.eth.block_number)
+            if latest_block is None:
+                print("⚠️ Could not fetch latest block number, retrying...")
+                time.sleep(5)
+                continue
+                
+            to_block = min(current_block + CHUNK_SIZE - 1, latest_block)
 
-        if current_block > to_block:
+            if current_block > to_block:
+                time.sleep(5)
+                continue
+        except Exception as e:
+            print(f"❌ Error fetching latest block: {e}")
             time.sleep(5)
             continue
 
@@ -302,9 +357,32 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                 logs_by_tx[tx_hash].append(log)
 
             for tx_hash, tx_logs in logs_by_tx.items():
-                tx = w3.eth.get_transaction(tx_hash)
-                block = w3.eth.get_block(tx["blockNumber"])
-                block_timestamp = block["timestamp"]
+                try:
+                    # Fetch transaction data with proper error handling and delays
+                    tx = web3_call_with_retries(lambda: w3.eth.get_transaction(tx_hash))
+                    time.sleep(RATE_LIMIT_DELAY)  # Rate limiting delay
+                    
+                    receipt = web3_call_with_retries(lambda: w3.eth.get_transaction_receipt(tx_hash))
+                    time.sleep(RATE_LIMIT_DELAY)  # Rate limiting delay
+                    
+                    # Calculate transaction fee in ETH
+                    gas_price = tx.get("gasPrice", 0) if tx else 0
+                    gas_used = receipt.get("gasUsed", 0) if receipt else 0
+                    fee_paid = (gas_price * gas_used) / 1e18  # Convert to ETH
+                    
+                    block_number = tx.get("blockNumber") if tx else None
+                    if block_number is None:
+                        print(f"⚠️ No block number found for transaction {tx_hash}")
+                        continue
+                        
+                    block = web3_call_with_retries(lambda: w3.eth.get_block(block_number))
+                    time.sleep(RATE_LIMIT_DELAY)  # Rate limiting delay
+                    block_timestamp = block.get("timestamp", int(time.time())) if block else int(time.time())
+
+                except (Exception, ConnectionError) as e:
+                    print(f"❌ Network error while fetching tx/block data for {tx_hash}: {e}")
+                    time.sleep(ERROR_RETRY_DELAY)  # Longer delay on error
+                    continue
 
                 user_tax_value = None
                 user_token = None
@@ -335,12 +413,16 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                         "txHash": f"0x{tx_hash}",
                         "txLink": f"https://basescan.org/tx/0x{tx_hash}",
                         "lp": lp_address,
-                        "maker": tx["from"],
+                        "maker": tx.get("from", "unknown"),
                         "swapType": swap_type,
                         "timestamp": int(time.time()),
                         "timestampReadable": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(block_timestamp)),
                         "label": "swap",
-                        "receiver": tx["from"]
+                        "receiver": tx.get("from", "unknown"),
+                        "gasPrice": gas_price,
+                        "gasUsed": gas_used,
+                        "transactionFee": fee_paid,  # ETH fee paid for the transaction
+                        "gasPriceGwei": gas_price / 1e9 if gas_price else 0  # Gas price in Gwei
                     }
 
                     if swap_type == "buy":
@@ -383,6 +465,8 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
 
                     # Insert swap data
                     result = collection.insert_one(swap_data)
+                    # Keep only the latest 10 swaps (comment out next line to store all swaps)
+                    enforce_latest_n_swaps(collection, 10)
                     
                     if VERBOSE_OUTPUT:
                         print(f"💾 {swap_type.upper()} swap stored: {tx_hash}")
@@ -427,7 +511,11 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                             "timestamp": int(time.time()),
                             "timestampReadable": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(block_timestamp)),
                             "label": "auto-swap" if user_tax_value is not None else "auto-swap-outside-transfer",
-                            "receiver": "0x7E26173192D72fd6D75A759F888d61c2cdbB64B1"
+                            "receiver": "0x7E26173192D72fd6D75A759F888d61c2cdbB64B1",
+                            "gasPrice": gas_price,
+                            "gasUsed": gas_used,
+                            "transactionFee": fee_paid,  # ETH fee paid for the transaction
+                            "gasPriceGwei": gas_price / 1e9 if gas_price else 0  # Gas price in Gwei
                         }
 
                         token0 = "Virtual"
@@ -459,6 +547,8 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
 
                         # Insert auto-swap data
                         result = collection.insert_one(swap_data)
+                        # Keep only the latest 10 swaps (comment out next line to store all swaps)
+                        enforce_latest_n_swaps(collection, 10)
                         
                         if VERBOSE_OUTPUT:
                             print(f"🤖 AUTO-{swap_type.upper()} swap stored: {tx_hash}")
@@ -501,13 +591,17 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
         )
 
         current_block = to_block + 1
-        time.sleep(1)
+        # time.sleep(1)  # Removed or minimized for speed
 
 def newTokenMonitor():
     """Monitor for new tokens to track"""
+    active_tokens = set()  # Track currently active tokens
+    
     while True:
         try:
-            personas = db["New Persona"].find()
+            personas = db["personas"].find()
+            new_tokens = []
+            
             for persona in personas:
                 token_address = persona.get("token")
                 token_symbol = persona.get("symbol", "unknown")
@@ -519,13 +613,35 @@ def newTokenMonitor():
                     continue
 
                 if lp_address and lp_address.lower() not in tracked_tokens:
+                    new_tokens.append((lp_address, token_symbol, token_address, block_number))
                     tracked_tokens.add(lp_address.lower())
-                    threading.Thread(
-                        target=track_lp_swaps,
-                        args=(lp_address, token_symbol, token_address, block_number),
-                        daemon=True
-                    ).start()
-                    print(f"🚀 STARTED TRACKING: {token_symbol} WITH LIQUIDITY POOL: {lp_address}")
+
+            # Process tokens based on configuration
+            if PROCESS_TOKENS_SEQUENTIALLY:
+                # Process one token at a time
+                for lp_address, token_symbol, token_address, block_number in new_tokens:
+                    if lp_address.lower() not in active_tokens:
+                        active_tokens.add(lp_address.lower())
+                        print(f"🚀 STARTING SEQUENTIAL TRACKING: {token_symbol} WITH LIQUIDITY POOL: {lp_address}")
+                        
+                        # Track this token (this will block until completion or error)
+                        try:
+                            track_lp_swaps(lp_address, token_symbol, token_address, block_number)
+                        except Exception as e:
+                            print(f"❌ Error tracking {token_symbol}: {e}")
+                            active_tokens.discard(lp_address.lower())
+                            tracked_tokens.discard(lp_address.lower())
+            else:
+                # Process all tokens in parallel (original behavior)
+                for lp_address, token_symbol, token_address, block_number in new_tokens:
+                    if lp_address.lower() not in active_tokens:
+                        active_tokens.add(lp_address.lower())
+                        threading.Thread(
+                            target=track_lp_swaps,
+                            args=(lp_address, token_symbol, token_address, block_number),
+                            daemon=True
+                        ).start()
+                        print(f"🚀 STARTED PARALLEL TRACKING: {token_symbol} WITH LIQUIDITY POOL: {lp_address}")
 
         except Exception as e:
             print(f"❌ ERROR IN newTokenMonitor: {e}")
@@ -709,6 +825,40 @@ def analyze_existing_swaps():
     print(f"📄 Results saved to: {output_file}")
     print("=" * 50)
 
+def show_latest_genesis_swaps(n=10):
+    """
+    Show the latest n Genesis token swap events from all _swap collections.
+    """
+    print(f"\n🔎 Fetching the latest {n} Genesis token swap events...")
+    collections = [name for name in db.list_collection_names() if name.endswith("_swap")]
+    if not collections:
+        print("⚠️ No '_swap' collections found.")
+        return
+    all_swaps = []
+    for coll_name in collections:
+        collection = db[coll_name]
+        # Get latest n swaps from this collection
+        docs = list(collection.find().sort("blockNumber", -1).limit(n))
+        for doc in docs:
+            all_swaps.append((doc.get("blockNumber", 0), coll_name, doc))
+    # Sort all swaps by blockNumber descending
+    all_swaps.sort(reverse=True, key=lambda x: x[0])
+    # Take the top n
+    latest_swaps = all_swaps[:n]
+    if not latest_swaps:
+        print("⚠️ No swap events found.")
+        return
+    print(f"\n{'Block':<10} {'Collection':<20} {'Token':<12} {'Type':<6} {'Amount':<18} {'TxHash':<66}")
+    print("-"*120)
+    for block, coll_name, doc in latest_swaps:
+        # Try to extract token and amount info
+        token = doc.get("genesis_token_name") or coll_name.replace("_swap", "").upper()
+        swap_type = doc.get("swapType", "?")
+        amount = doc.get(f"{token}_IN") or doc.get(f"{token}_OUT") or "-"
+        tx_hash = doc.get("txHash", "")[0:64]
+        print(f"{block:<10} {coll_name:<20} {token:<12} {swap_type:<6} {amount:<18} {tx_hash}")
+    print("\nDone.\n")
+
 # =============================================================================
 # MAIN FUNCTIONS
 # =============================================================================
@@ -747,21 +897,24 @@ def main():
     print("analyzes them immediately, and stores results in MongoDB.")
     print("=" * 60)
     print("1. Start real-time tracking & analysis")
-    print("2. Exit")
+    print("2. Show latest 10 Genesis swaps")
+    print("3. Exit")
     print("=" * 60)
     
     while True:
         try:
-            choice = input("Select an option (1-2): ").strip()
+            choice = input("Select an option (1-3): ").strip()
             
             if choice == "1":
                 start_tracking()
                 break
             elif choice == "2":
+                show_latest_genesis_swaps(10)
+            elif choice == "3":
                 print("👋 Goodbye!")
                 break
             else:
-                print("❌ Invalid choice. Please select 1-2.")
+                print("❌ Invalid choice. Please select 1-3.")
                 
         except KeyboardInterrupt:
             print("\n👋 Goodbye!")
