@@ -30,7 +30,7 @@ load_dotenv()
 
 # MongoDB Connection (from environment variables)
 MONGO_URI = os.getenv("MONGO_URI")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "virtualgenesis")
+DATABASE_NAME = "genesis_tokens_swap_info"  # New database for Genesis tokens swap info
 
 # Blockchain RPC (from environment variables)
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
@@ -70,6 +70,15 @@ ERROR_RETRY_DELAY = 2  # Reduce delay on errors (seconds)
 SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
 CHUNK_SIZE = 2000  # Increased block processing chunk size for speed
 
+# Genesis tokens swap info database settings
+GENESIS_DB_NAME = "genesis_tokens_swap_info"  # Database name for all Genesis tokens swap data
+STORE_ALL_SWAPS = True  # Store all swaps, not just latest
+
+# Unified collection settings
+ENABLE_UNIFIED_COLLECTION = True  # Set to True to store data in unified collection
+MAIN_COLLECTION_NAME = "genesis_token"  # Main collection for Genesis tokens
+UNIFIED_COLLECTION_STRUCTURE = "genesis_token"  # Use genesis_token structure
+
 # =============================================================================
 # BLOCKCHAIN CONNECTIONS
 # =============================================================================
@@ -79,7 +88,8 @@ w3 = Web3(Web3.HTTPProvider(ALCHEMY_URL))
 
 # Initialize MongoDB connection
 client = MongoClient(MONGO_URI)
-db = client[DATABASE_NAME]
+db = client[GENESIS_DB_NAME]  # Use the Genesis tokens swap info database
+personas_db = client["virtualgenesis"]  # Keep personas in original database
 
 # Tracked tokens set
 tracked_tokens = set()
@@ -123,6 +133,62 @@ POOL_ABI = [
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
+
+def get_persona_info(token_address):
+    """
+    Get persona information for a given token address
+    
+    Args:
+        token_address: The token contract address
+    
+    Returns:
+        dict: Persona information or None if not found
+    """
+    try:
+        persona = personas_db["personas"].find_one({"token": token_address})
+        return persona
+    except Exception as e:
+        if VERBOSE_OUTPUT:
+            print(f"⚠️ Error fetching persona info for {token_address}: {e}")
+        return None
+
+def get_collection_name(token_symbol):
+    """
+    Get the collection name for a Genesis token
+    
+    Args:
+        token_symbol: The token symbol
+    
+    Returns:
+        str: Collection name in format {token}_swap
+    """
+    return f"{token_symbol.lower()}_swap"
+
+def create_genesis_database():
+    """
+    Create the Genesis tokens swap info database structure
+    """
+    try:
+        print(f"✅ Genesis tokens swap info database: {GENESIS_DB_NAME}")
+        print(f"   Collections will be created as: <token>_swap")
+        print(f"   Storing ALL swaps: {'YES' if STORE_ALL_SWAPS else 'NO'}")
+        print(f"   Personas database: virtualgenesis")
+        
+    except Exception as e:
+        print(f"❌ Error creating Genesis database: {e}")
+
+def create_unified_collection():
+    """
+    Create the Genesis tokens swap info database structure
+    """
+    try:
+        print(f"✅ Genesis tokens swap info database: {GENESIS_DB_NAME}")
+        print(f"   Collections will be created as: <token>_swap")
+        print(f"   Storing ALL swaps: {'YES' if STORE_ALL_SWAPS else 'NO'}")
+        print(f"   Personas database: virtualgenesis")
+        
+    except Exception as e:
+        print(f"❌ Error creating Genesis database: {e}")
 
 def web3_call_with_retries(func, max_retries=3, delay=1):
     """
@@ -277,18 +343,94 @@ def swapTypeFinder(decoded):
     else:
         return "unknown"
 
-def enforce_latest_n_swaps(collection, n=10):
+def store_swap_data(swap_data, token_address, token_symbol, persona_info=None):
     """
-    Keep only the latest n documents in the collection (by blockNumber descending).
-    To disable this limit and store all swaps, simply comment out the call to this function.
+    Store swap data in the Genesis token's collection with persona information
+    
+    Args:
+        swap_data: The swap transaction data
+        token_address: The Genesis token contract address
+        token_symbol: The Genesis token symbol
+        persona_info: Optional persona information from the personas collection
     """
-    count = collection.count_documents({})
-    if count > n:
-        # Find the _ids of the oldest documents to delete
-        to_delete = collection.find({}, {"_id": 1}).sort("blockNumber", 1).limit(count - n)
-        ids = [doc["_id"] for doc in to_delete]
-        if ids:
-            collection.delete_many({"_id": {"$in": ids}})
+    try:
+        # Get persona info if not provided
+        if persona_info is None:
+            persona_info = get_persona_info(token_address)
+        
+        # Get the collection name for this token
+        collection_name = get_collection_name(token_symbol)
+        collection = db[collection_name]
+        
+        # Create document with all swap data and persona info
+        swap_doc = {
+            # Basic swap information
+            "blockNumber": swap_data.get("blockNumber"),
+            "txHash": swap_data.get("txHash"),
+            "txLink": swap_data.get("txLink"),
+            "lp": swap_data.get("lp"),
+            "maker": swap_data.get("maker"),
+            "swapType": swap_data.get("swapType"),
+            "timestamp": swap_data.get("timestamp"),
+            "timestampReadable": swap_data.get("timestampReadable"),
+            "label": swap_data.get("label"),
+            "receiver": swap_data.get("receiver"),
+            
+            # Gas and fee information
+            "gasPrice": swap_data.get("gasPrice"),
+            "gasUsed": swap_data.get("gasUsed"),
+            "transactionFee": swap_data.get("transactionFee"),
+            "gasPriceGwei": swap_data.get("gasPriceGwei"),
+            
+            # Genesis token information
+            "genesis_token_address": token_address,
+            "genesis_token_symbol": token_symbol,
+            
+            # Swap amounts
+            "Virtual_IN": swap_data.get("Virtual_IN"),
+            "Virtual_OUT": swap_data.get("Virtual_OUT"),
+            f"{token_symbol.upper()}_IN": swap_data.get(f"{token_symbol.upper()}_IN"),
+            f"{token_symbol.upper()}_OUT": swap_data.get(f"{token_symbol.upper()}_OUT"),
+            
+            # Tax information
+            "Tax_1pct": swap_data.get("Tax_1pct"),
+            f"{token_symbol.upper()}_IN_BeforeTax": swap_data.get(f"{token_symbol.upper()}_IN_BeforeTax"),
+            f"{token_symbol.upper()}_IN_AfterTax": swap_data.get(f"{token_symbol.upper()}_IN_AfterTax"),
+            f"{token_symbol.upper()}_OUT_BeforeTax": swap_data.get(f"{token_symbol.upper()}_OUT_BeforeTax"),
+            f"{token_symbol.upper()}_OUT_AfterTax": swap_data.get(f"{token_symbol.upper()}_OUT_AfterTax"),
+            
+            # Price analysis results (if available)
+            "virtual_usdc_price": swap_data.get("virtual_usdc_price"),
+            "genesis_virtual_price": swap_data.get("genesis_virtual_price"),
+            "genesis_usdc_price": swap_data.get("genesis_usdc_price"),
+            "genesis_token_name": swap_data.get("genesis_token_name"),
+        }
+        
+        # Add persona information if available
+        if persona_info:
+            swap_doc.update({
+                "persona_virtualId": persona_info.get("virtualId"),
+                "persona_dao": persona_info.get("dao"),
+                "persona_tba": persona_info.get("tba"),
+                "persona_veToken": persona_info.get("veToken"),
+                "persona_lp": persona_info.get("lp"),
+                "persona_name": persona_info.get("name"),
+                "persona_symbol": persona_info.get("symbol"),
+                "persona_txHash": persona_info.get("txHash"),
+                "persona_blockNumber": persona_info.get("blockNumber"),
+            })
+        
+        # Store in the token's collection
+        result = collection.insert_one(swap_doc)
+        
+        if VERBOSE_OUTPUT:
+            print(f"💾 Stored in {collection_name}: {token_symbol} {swap_data.get('swapType')} swap")
+            
+        return result.inserted_id
+        
+    except Exception as e:
+        print(f"❌ Error storing swap data: {e}")
+        return None
 
 def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
     """
@@ -302,7 +444,7 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
     """
     lp_address = Web3.to_checksum_address(lp_address)
     token_address = Web3.to_checksum_address(token_address)
-    collection = db[f"{token_symbol.lower()}_swap"]
+    collection = db[get_collection_name(token_symbol)]  # Use the new collection naming
     progress_coll = db["swap_progress"]
     
     # Check for existing progress
@@ -463,10 +605,8 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                         user_token = token1
                         user_token_field = f"{token1}_IN"
 
-                    # Insert swap data
-                    result = collection.insert_one(swap_data)
-                    # Keep only the latest 10 swaps (comment out next line to store all swaps)
-                    enforce_latest_n_swaps(collection, 10)
+                    # Insert swap data into unified collection only
+                    store_swap_data(swap_data, token_address, token_symbol)
                     
                     if VERBOSE_OUTPUT:
                         print(f"💾 {swap_type.upper()} swap stored: {tx_hash}")
@@ -475,7 +615,7 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                     if ENABLE_PRICE_ANALYSIS:
                         analysis_result = analyze_swap_transaction(swap_data, f"{token_symbol.lower()}_swap")
                         if analysis_result:
-                            # Update MongoDB with calculated prices
+                            # Update unified collection with calculated prices
                             if UPDATE_MONGODB:
                                 update_data = {
                                     "virtual_usdc_price": analysis_result["virtual_usdc_price"],
@@ -484,10 +624,21 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                                     "genesis_token_name": analysis_result["genesis_token_name"],
                                 }
                                 
-                                collection.update_one(
-                                    {"_id": result.inserted_id},
+                                # Update the unified collection document
+                                collection_name = get_collection_name(token_symbol)
+                                unified_collection = db[collection_name]
+                                
+                                # Find and update the document by txHash and blockNumber
+                                unified_collection.update_one(
+                                    {
+                                        "txHash": swap_data.get("txHash"),
+                                        "blockNumber": swap_data.get("blockNumber")
+                                    },
                                     {"$set": update_data}
                                 )
+                                
+                                # Update swap_data with price analysis results for display
+                                swap_data.update(update_data)
 
                             # Display transaction details
                             if SHOW_TRANSACTION_DETAILS:
@@ -497,6 +648,9 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                                     f"Virtual/USDC: ${analysis_result['virtual_usdc_price']:.8f} | "
                                     f"{analysis_result['genesis_token_name']}/USDC: ${analysis_result['genesis_usdc_price']:.8f}"
                                 )
+                    
+                    # Store in unified collection
+                    store_swap_data(swap_data, token_address, token_symbol)
 
                 # Handle auto-swaps
                 if pending_auto_swaps:
@@ -545,10 +699,8 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                                 swap_data[f"{user_token_field}_BeforeTax"] = amount_in
                                 swap_data[f"{user_token_field}_AfterTax"] = updated_amount
 
-                        # Insert auto-swap data
-                        result = collection.insert_one(swap_data)
-                        # Keep only the latest 10 swaps (comment out next line to store all swaps)
-                        enforce_latest_n_swaps(collection, 10)
+                        # Insert auto-swap data into unified collection only
+                        store_swap_data(swap_data, token_address, token_symbol)
                         
                         if VERBOSE_OUTPUT:
                             print(f"🤖 AUTO-{swap_type.upper()} swap stored: {tx_hash}")
@@ -557,7 +709,7 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                         if ENABLE_PRICE_ANALYSIS:
                             analysis_result = analyze_swap_transaction(swap_data, f"{token_symbol.lower()}_swap")
                             if analysis_result:
-                                # Update MongoDB with calculated prices
+                                # Update unified collection with calculated prices
                                 if UPDATE_MONGODB:
                                     update_data = {
                                         "virtual_usdc_price": analysis_result["virtual_usdc_price"],
@@ -566,10 +718,21 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                                         "genesis_token_name": analysis_result["genesis_token_name"],
                                     }
                                     
-                                    collection.update_one(
-                                        {"_id": result.inserted_id},
+                                    # Update the unified collection document
+                                    collection_name = get_collection_name(token_symbol)
+                                    unified_collection = db[collection_name]
+                                    
+                                    # Find and update the document by txHash and blockNumber
+                                    unified_collection.update_one(
+                                        {
+                                            "txHash": swap_data.get("txHash"),
+                                            "blockNumber": swap_data.get("blockNumber")
+                                        },
                                         {"$set": update_data}
                                     )
+                                    
+                                    # Update swap_data with price analysis results for display
+                                    swap_data.update(update_data)
 
                                 # Display transaction details
                                 if SHOW_TRANSACTION_DETAILS:
@@ -579,6 +742,9 @@ def track_lp_swaps(lp_address, token_symbol, token_address, start_block):
                                         f"Virtual/USDC: ${analysis_result['virtual_usdc_price']:.8f} | "
                                         f"{analysis_result['genesis_token_name']}/USDC: ${analysis_result['genesis_usdc_price']:.8f}"
                                     )
+                        
+                        # Store in unified collection
+                        store_swap_data(swap_data, token_address, token_symbol)
 
         except Exception as e:
             print(f"❌ Error in block range {current_block}-{to_block}: {e}")
@@ -599,7 +765,7 @@ def newTokenMonitor():
     
     while True:
         try:
-            personas = db["personas"].find()
+            personas = personas_db["personas"].find()
             new_tokens = []
             
             for persona in personas:
@@ -825,6 +991,81 @@ def analyze_existing_swaps():
     print(f"📄 Results saved to: {output_file}")
     print("=" * 50)
 
+def show_latest_unified_swaps(n=10):
+    """
+    Show the latest n Genesis token swap events from the unified collection.
+    """
+    if not ENABLE_UNIFIED_COLLECTION:
+        print("⚠️ Unified collection is disabled in configuration")
+        return
+        
+    print(f"\n🔎 Fetching the latest {n} Genesis token swap events from unified collection...")
+    
+    try:
+        if UNIFIED_COLLECTION_STRUCTURE == "genesis_token":
+            # For genesis_token structure, find all collections that end with _swap
+            all_collections = db.list_collection_names()
+            unified_collections = [col for col in all_collections if col.endswith("_swap")]
+            
+            if not unified_collections:
+                print("⚠️ No unified collections found.")
+                return
+                
+            print(f"📁 Found {len(unified_collections)} swap collections:")
+            for col in unified_collections:
+                print(f"   - {col}")
+            
+            # Get latest swaps from all collections
+            all_swaps = []
+            for coll_name in unified_collections:
+                collection = db[coll_name]
+                # Get latest n swaps from this collection
+                docs = list(collection.find().sort("blockNumber", -1).limit(n))
+                for doc in docs:
+                    all_swaps.append((doc.get("blockNumber", 0), coll_name, doc))
+        else:
+            # For flat structure, use the main collection
+            unified_collection = db[MAIN_COLLECTION_NAME]
+            # Get latest n swaps from unified collection
+            docs = list(unified_collection.find().sort("blockNumber", -1).limit(n))
+            all_swaps = [(doc.get("blockNumber", 0), MAIN_COLLECTION_NAME, doc) for doc in docs]
+        
+        if not all_swaps:
+            print("⚠️ No swap events found in unified collection.")
+            return
+            
+        # Sort all swaps by blockNumber descending
+        all_swaps.sort(reverse=True, key=lambda x: x[0])
+        # Take the top n
+        latest_swaps = all_swaps[:n]
+        
+        print(f"\n{'Block':<10} {'Collection':<20} {'Token':<12} {'Type':<6} {'Amount':<18} {'Virtual/USDC':<15} {'Token/USDC':<15} {'TxHash':<66}")
+        print("-"*150)
+        
+        for block, coll_name, doc in latest_swaps:
+            token = doc.get("genesis_token_symbol", "UNKNOWN")
+            swap_type = doc.get("swapType", "?")
+            
+            # Get amount based on swap type
+            if swap_type == "buy":
+                amount = doc.get(f"{token}_OUT", "-")
+            else:
+                amount = doc.get(f"{token}_IN", "-")
+                
+            virtual_usdc_price = doc.get("virtual_usdc_price", "-")
+            genesis_usdc_price = doc.get("genesis_usdc_price", "-")
+            tx_hash = doc.get("txHash", "")[0:64]
+            
+            # Truncate collection name for display
+            display_coll = coll_name[:18] + ".." if len(coll_name) > 20 else coll_name
+            
+            print(f"{block:<10} {display_coll:<20} {token:<12} {swap_type:<6} {amount:<18} {virtual_usdc_price:<15} {genesis_usdc_price:<15} {tx_hash}")
+            
+        print(f"\n✅ Found {len(latest_swaps)} swap events in unified collection")
+        
+    except Exception as e:
+        print(f"❌ Error fetching from unified collection: {e}")
+
 def show_latest_genesis_swaps(n=10):
     """
     Show the latest n Genesis token swap events from all _swap collections.
@@ -881,6 +1122,9 @@ def start_tracking():
     print(f"🔍 Price analysis: {'ON' if ENABLE_PRICE_ANALYSIS else 'OFF'}")
     print("=" * 50)
     
+    # Create Genesis database structure
+    create_genesis_database()
+    
     # Start token monitor in background
     threading.Thread(target=newTokenMonitor, daemon=True).start()
     print("🔄 Token monitor started - waiting for new tokens to track...")
@@ -897,13 +1141,14 @@ def main():
     print("analyzes them immediately, and stores results in MongoDB.")
     print("=" * 60)
     print("1. Start real-time tracking & analysis")
-    print("2. Show latest 10 Genesis swaps")
-    print("3. Exit")
+    print("2. Show latest 10 Genesis swaps (individual collections)")
+    print("3. Show latest 10 Genesis swaps (unified collection)")
+    print("4. Exit")
     print("=" * 60)
     
     while True:
         try:
-            choice = input("Select an option (1-3): ").strip()
+            choice = input("Select an option (1-4): ").strip()
             
             if choice == "1":
                 start_tracking()
@@ -911,10 +1156,12 @@ def main():
             elif choice == "2":
                 show_latest_genesis_swaps(10)
             elif choice == "3":
+                show_latest_unified_swaps(10)
+            elif choice == "4":
                 print("👋 Goodbye!")
                 break
             else:
-                print("❌ Invalid choice. Please select 1-3.")
+                print("❌ Invalid choice. Please select 1-4.")
                 
         except KeyboardInterrupt:
             print("\n👋 Goodbye!")
